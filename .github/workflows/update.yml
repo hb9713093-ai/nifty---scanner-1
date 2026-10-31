@@ -1,0 +1,49 @@
+name: Update Nifty 500 scanner
+
+on:
+  schedule:
+    - cron: "15 11 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      check:
+        description: "Optional: one symbol to debug (e.g. AXISBANK). Leave empty for a full run"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scanner
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: pip install --upgrade yfinance pandas numpy requests
+
+      - name: Run scanner
+        env:
+          CHECK: ${{ github.event.inputs.check }}
+        run: |
+          if [ -n "$CHECK" ]; then
+            python scanner.py --check "$CHECK"
+          else
+            python scanner.py
+          fi
+
+      - name: Commit results
+        run: |
+          git config user.name "scanner-bot"
+          git config user.email "scanner-bot@users.noreply.github.com"
+          git add index.html fundamentals.json dhan_slugs.json nifty500.csv || true
+          git diff --cached --quiet || (git commit -m "Update scanner $(date -u +%F)" && git push)
