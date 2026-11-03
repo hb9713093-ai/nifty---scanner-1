@@ -10,10 +10,14 @@ Trend colour logic (replicated from the SSL Hybrid baseline in Ricky's indicator
   Grey  = close inside channel
 A "flip" is any day whose colour differs from the previous day.
 
+Outputs:
+  index.html          the website (table + click-TV popup chart)
+  data/<SYMBOL>.json  last ~6 months of candles + channel for each stock (popup chart)
+
 Usage:
-  python scanner.py                 full run, writes index.html
+  python scanner.py                   full run
   python scanner.py --check AXISBANK  prints recent colours + last flips for one stock
-  python scanner.py --limit 40      quick test on first 40 stocks
+  python scanner.py --limit 40        quick test on first 40 stocks
 """
 import argparse
 import io
@@ -34,8 +38,10 @@ import yfinance as yf
 # ----------------------------- settings -----------------------------
 MA_LEN = 30
 KELT_MULT = 0.2
-HISTORY = "5y"
+HISTORY_DAYS = 1830             # ~5 years of daily candles
+FLIP_WINDOW_DAYS = 7            # only show stocks whose latest flip is within this many days
 BATCH_SIZE = 50
+CHART_BARS = 130                # ~6 months of daily candles in the popup chart
 LAYOUT_ID = "AXNXjCz0"          # your saved TradingView layout (indicator pre-loaded)
 FUND_MAX_AGE_DAYS = 7           # refresh PE/ROE/EPS weekly
 FUND_TIME_BUDGET_S = 600        # max seconds per run spent on fundamentals
@@ -44,31 +50,13 @@ STALE_DAYS = 10                 # skip stocks whose last candle is older than th
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 UNIVERSE_CACHE = "nifty500.csv"
 FUND_CACHE = "fundamentals.json"
-DHAN_CACHE = "dhan_slugs.json"
+DATA_DIR = "data"
 OUT_HTML = "index.html"
 
 NSE_URLS = [
     "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
     "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
     "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
-]
-DHAN_PAGES = [
-    "https://dhan.co/all-stocks-list/",
-    "https://dhan.co/nifty-stocks-list/nifty-50/",
-    "https://dhan.co/nifty-stocks-list/nifty-next-50/",
-    "https://dhan.co/nifty-stocks-list/nifty-bank/",
-    "https://dhan.co/nifty-stocks-list/nifty-fin-services/",
-    "https://dhan.co/nifty-stocks-list/nifty-it/",
-    "https://dhan.co/nifty-stocks-list/nifty-auto/",
-    "https://dhan.co/nifty-stocks-list/nifty-fmcg/",
-    "https://dhan.co/nifty-stocks-list/nifty-pharma/",
-    "https://dhan.co/nifty-stocks-list/nifty-energy/",
-    "https://dhan.co/nifty-stocks-list/nifty-metal/",
-    "https://dhan.co/nifty-stocks-list/nifty-realty/",
-    "https://dhan.co/stocks/market/large-cap-stocks/",
-    "https://dhan.co/stocks/market/mid-cap-stocks/",
-    "https://dhan.co/stocks/market/small-cap-stocks/",
-    "https://dhan.co/sitemap/",
 ]
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -111,64 +99,6 @@ def tv_symbol(sym):
 
 def tv_link(sym):
     return f"https://www.tradingview.com/chart/{LAYOUT_ID}/?symbol=" + quote(f"NSE:{tv_symbol(sym)}", safe="")
-
-
-# ----------------------------- Dhan links (best effort) -----------------------------
-DROP = {"ltd", "limited", "the", "and", "co", "company"}
-
-
-def toks(s):
-    s = s.lower().replace("&", " and ")
-    return frozenset(t for t in re.findall(r"[a-z0-9]+", s) if t not in DROP)
-
-
-def load_dhan_slugs():
-    cached = []
-    if os.path.exists(DHAN_CACHE):
-        try:
-            cached = json.load(open(DHAN_CACHE))
-        except Exception:
-            cached = []
-    found = set(cached)
-    rx = re.compile(r"/stocks/([a-z0-9][a-z0-9\-]*?)-share-price/?")
-    for url in DHAN_PAGES:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=25)
-            if r.status_code != 200:
-                continue
-            for m in rx.findall(r.text):
-                found.add(m)
-        except Exception as e:
-            log(f"Dhan page failed ({url}): {e}")
-    found = sorted(found)
-    try:
-        json.dump(found, open(DHAN_CACHE, "w"))
-    except Exception:
-        pass
-    log(f"Dhan slugs known: {len(found)}")
-    return found
-
-
-def match_dhan(name, slug_toks):
-    a = toks(name)
-    if not a:
-        return None
-    best, best_j, tie = None, 0.0, False
-    for slug, b in slug_toks.items():
-        inter = len(a & b)
-        if inter == 0:
-            continue
-        j = inter / len(a | b)
-        ok = (a == b) or ((a <= b or b <= a) and j >= 0.6) or j >= 0.85
-        if not ok:
-            continue
-        if j > best_j:
-            best, best_j, tie = slug, j, False
-        elif j == best_j:
-            tie = True
-    if best is None or tie:
-        return None
-    return f"https://dhan.co/stocks/{best}-share-price/"
 
 
 # ----------------------------- indicator -----------------------------
@@ -232,6 +162,25 @@ def num(x, d=2):
     return round(x, d)
 
 
+def chart_payload(df, ema, up, lo):
+    n = min(CHART_BARS, len(df))
+    sl = slice(len(df) - n, len(df))
+
+    def arr(a):
+        return [None if not np.isfinite(v) else round(float(v), 2) for v in np.asarray(a, float)[sl]]
+
+    return {
+        "d": [d.strftime("%Y-%m-%d") for d in df.index[sl]],
+        "o": arr(df["Open"].to_numpy(float)),
+        "h": arr(df["High"].to_numpy(float)),
+        "l": arr(df["Low"].to_numpy(float)),
+        "c": arr(df["Close"].to_numpy(float)),
+        "e": arr(ema),
+        "u": arr(up),
+        "b": arr(lo),
+    }
+
+
 def analyse(df):
     df = df.dropna(subset=["Close", "High", "Low"]).copy()
     idx = pd.to_datetime(df.index)
@@ -239,6 +188,9 @@ def analyse(df):
         idx = idx.tz_localize(None)
     df.index = idx.normalize()
     df = df[~df.index.duplicated(keep="last")].sort_index()
+    now = dt.datetime.now(IST)
+    if len(df) and df.index[-1].date() == now.date() and (now.hour, now.minute) < (15, 45):
+        df = df.iloc[:-1]            # today's candle is still forming: use closed daily candles only
     if len(df) < MA_LEN * 3:
         return None
     ema, up, lo, state, valid = compute_states(df)
@@ -263,6 +215,7 @@ def analyse(df):
         "d200": num(c[-200:].mean()) if len(c) >= 200 else None,
         "cur": NAMES.get(int(state[-1])) if valid[-1] else None,
         "fd": None, "dir": None,
+        "chart": chart_payload(df, ema, up, lo),
     }
     if flips:
         i, a, b = flips[-1]
@@ -272,10 +225,18 @@ def analyse(df):
 
 
 # ----------------------------- prices -----------------------------
+def date_range():
+    today = dt.datetime.now(IST).date()
+    start = today - dt.timedelta(days=HISTORY_DAYS)
+    end = today + dt.timedelta(days=1)          # end date is exclusive
+    return start.isoformat(), end.isoformat()
+
+
 def download_batch(tickers):
+    start, end = date_range()
     for attempt in range(3):
         try:
-            df = yf.download(tickers, period=HISTORY, interval="1d", auto_adjust=False,
+            df = yf.download(tickers, start=start, end=end, interval="1d", auto_adjust=False,
                              group_by="ticker", threads=True, progress=False)
             if df is not None and not df.empty:
                 return df
@@ -381,7 +342,7 @@ input[type=search]{flex:1 1 150px;min-width:130px}
 .chip.on{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc) inset}
 label.tg{display:inline-flex;align-items:center;gap:5px;font-size:12px}
 .wrap{margin:4px 8px 16px;border:1px solid var(--bd);border-radius:10px;background:var(--card);overflow:auto;max-height:calc(100vh - 190px);max-height:calc(100dvh - 190px);-webkit-overflow-scrolling:touch}
-table{border-collapse:separate;border-spacing:0;width:100%;min-width:1500px}
+table{border-collapse:separate;border-spacing:0;width:100%;min-width:1400px}
 th,td{padding:7px 9px;border-bottom:1px solid var(--bd);white-space:nowrap;text-align:right}
 th{position:sticky;top:0;background:var(--card);z-index:2;cursor:pointer;font-weight:600;font-size:12px;user-select:none}
 th.nos{cursor:default}
@@ -390,12 +351,25 @@ th:nth-child(1){z-index:3}
 td:nth-child(2),th:nth-child(2),td:nth-child(3),th:nth-child(3),td:nth-child(15),th:nth-child(15),td:nth-child(16),th:nth-child(16){text-align:left}
 tr:hover td{background:rgba(120,140,170,.08)}
 a{color:var(--acc);text-decoration:none;font-weight:600}
+.tvb{border:1px solid var(--acc);border-radius:6px;padding:2px 8px}
 .up{color:var(--up)}.dn{color:var(--dn)}.m{color:var(--mut)}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;vertical-align:middle}
 .dot.blue{background:var(--blue)}.dot.red{background:var(--red)}.dot.grey{background:var(--grey)}
 .bd{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--bd);border-radius:999px;padding:2px 8px;font-weight:600}
 .fs{display:block;color:var(--mut);font-size:11px;margin-top:2px}
+.warn{margin:6px 12px;padding:8px 10px;border:1px solid #d9a400;background:rgba(255,193,7,.14);border-radius:8px;font-size:12px}
 .foot{padding:0 12px 18px;color:var(--mut);font-size:11.5px}
+.md{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:50;padding:10px}
+.md[hidden]{display:none}
+.mc{background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:12px;width:min(1060px,100%);max-height:96vh;overflow:auto;padding:12px 14px}
+.mh{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-bottom:8px}
+.mh b{font-size:15px}
+.mbtn{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.mbtn button{background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:8px;padding:5px 10px;font-size:12px;cursor:pointer}
+.mbtn button.on{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc) inset}
+.cvw{width:100%}
+canvas{display:block;width:100%;touch-action:pan-y}
+.lg{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;color:var(--mut);font-size:11.5px}
 </style>
 </head>
 <body>
@@ -403,19 +377,34 @@ a{color:var(--acc);text-decoration:none;font-weight:600}
 <h1>Nifty 500 Trend Flips</h1>
 <div class="sub" id="meta"></div>
 </header>
+<div class="warn" id="warn" hidden></div>
 <div class="ctl">
 <input type="search" id="q" placeholder="Search stock or symbol">
-<select id="days"><option value="0">Any flip date</option><option value="1">Flipped 1d</option><option value="3">Last 3d</option><option value="7">Last 7d</option><option value="14">Last 14d</option><option value="30">Last 30d</option><option value="90">Last 90d</option></select>
+<select id="days"><option value="0">Any (whole window)</option><option value="3">Last 3 days</option><option value="1">Last 1 day</option></select>
 <select id="cur"><option value="">Current: all</option><option>Blue</option><option>Grey</option><option>Red</option></select>
 <label class="tg"><input type="checkbox" id="hg"> Hide Grey flips</label>
 </div>
 <div class="ctl" id="chips"></div>
 <div class="sub" style="padding:0 12px" id="cnt"></div>
 <div class="wrap"><table id="t"></table></div>
-<div class="foot">Blue = close above channel, Red = close below, Grey = inside (EMA 30 baseline, 0.2 x ATR-style channel, daily). A flip is a change versus the previous daily close. Not investment advice.</div>
+<div class="foot">Only stocks whose latest colour flip happened in the last 7 days are listed. Click TV on any row to see its chart with your strategy colours. Blue = close above channel, Red = close below, Grey = inside (EMA 30 baseline, 0.2 x EMA of true range channel, daily). A flip is a colour change versus the previous daily close. Not investment advice.</div>
+
+<div class="md" id="md" hidden>
+<div class="mc">
+<div class="mh">
+<div><b id="mt"></b> <span id="mb"></span><div class="sub" id="ms"></div></div>
+<div class="mbtn"><button data-r="63">3M</button><button data-r="130" class="on">6M</button><a id="mtv" target="_blank" rel="noopener">Open in TradingView ↗</a><button id="mx">✕</button></div>
+</div>
+<div class="cvw"><canvas id="cv"></canvas></div>
+<div class="sub" id="mn"></div>
+<div class="lg"><span><i class="dot blue"></i> Blue: close above channel</span><span><i class="dot grey"></i> Grey: inside channel</span><span><i class="dot red"></i> Red: close below channel</span><span>▲ = colour flip</span><span>Thick line = baseline, dashed = channel</span></div>
+</div>
+</div>
+
 <script>
 const D=__DATA__;
 const ROWS=D.rows;
+const BYS={};ROWS.forEach(r=>{BYS[r.s]=r});
 const DIRS=['Blue>Red','Blue>Grey','Red>Blue','Red>Grey','Grey>Red','Grey>Blue'];
 const S={q:'',dirs:new Set(),days:0,cur:'',hg:false,sk:'fd',sd:-1};
 const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -431,7 +420,7 @@ const ago=n=>n==null?'':(n===0?'today':n+'d ago');
 const COLS=[
 {t:'Stock',h:r=>'<b>'+esc(r.n)+'</b>',s:r=>r.n.toLowerCase(),a:1},
 {t:'Symbol',h:r=>esc(r.s),s:r=>r.s,a:1},
-{t:'Chart',h:r=>'<a href="'+r.tv+'" target="_blank" rel="noopener">TV</a>'+(r.dh?' · <a href="'+r.dh+'" target="_blank" rel="noopener">Dhan</a>':''),nos:1},
+{t:'Chart',h:r=>'<a class="tvb" data-s="'+esc(r.s)+'" href="'+r.tv+'" target="_blank" rel="noopener">TV</a>',nos:1},
 {t:'LTP',h:r=>nf(r.ltp),s:r=>r.ltp},
 {t:'Chg %',h:r=>pc(r.chg),s:r=>r.chg},
 {t:'Volume',h:r=>r.vol==null?'-':Number(r.vol).toLocaleString('en-IN'),s:r=>r.vol},
@@ -482,11 +471,180 @@ function chips(){
  document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{
   const d=c.dataset.d;S.dirs.has(d)?S.dirs.delete(d):S.dirs.add(d);chips();render();});
 }
-$('#meta').textContent='Last updated: '+D.updated+' · data through '+fdate(D.asof)+' · '+ROWS.length+' stocks'+(D.skipped?' · '+D.skipped+' skipped':'');
+
+/* ---------- popup chart ---------- */
+const CC={'1':'#00c3ff','-1':'#ff0062','2':'#8a8f98','0':'#8a8f98'};
+const CN={'1':'Blue','-1':'Red','2':'Grey','0':'-'};
+let CH=null,TOKEN=0;
+const stOf=(c,u,b,i)=>(u[i]==null||b[i]==null||c[i]==null)?0:(c[i]>u[i]?1:(c[i]<b[i]?-1:2));
+async function openChart(r){
+ const tok=++TOKEN;
+ $('#md').hidden=false;document.body.style.overflow='hidden';
+ $('#mt').textContent=r.n+' ('+r.s+')';
+ $('#mb').innerHTML=curBadge(r.cur);
+ $('#ms').textContent=r.dir?('Last flip: '+r.dir.replace('>',' → ')+' · '+fdate(r.fd)+' · '+ago(r.fdays)):'No colour flip in the available history';
+ $('#mtv').href=r.tv;
+ $('#mn').textContent='Loading chart...';
+ CH=null;
+ const cv=$('#cv');cv.getContext('2d').clearRect(0,0,cv.width,cv.height);
+ try{
+  const res=await fetch('data/'+r.f+'.json?v='+encodeURIComponent(D.asof+D.updated));
+  if(!res.ok)throw new Error('HTTP '+res.status);
+  const j=await res.json();
+  if(tok!==TOKEN)return;
+  CH=j;CH.range=Math.min(CUR_RANGE,j.d.length);CH.hover=-1;
+  $('#mn').textContent='';
+  drawChart();
+ }catch(e){
+  if(tok===TOKEN)$('#mn').textContent='Chart data not available. Open the website link (not a downloaded file) and wait for the next daily update if this is new.';
+ }
+}
+let CUR_RANGE=130;
+function closeChart(){TOKEN++;$('#md').hidden=true;document.body.style.overflow='';CH=null;}
+function drawChart(){
+ if(!CH)return;
+ const cv=$('#cv'),box=cv.parentElement,dpr=window.devicePixelRatio||1;
+ const W=Math.max(300,box.clientWidth),H=W<600?320:440;
+ const pw0=Math.round(W*dpr),ph0=Math.round(H*dpr);
+ if(cv.width!==pw0||cv.height!==ph0){cv.width=pw0;cv.height=ph0;}
+ cv.style.height=H+'px';
+ const x=cv.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);
+ const cs=getComputedStyle(document.documentElement);
+ const tx=cs.getPropertyValue('--tx').trim()||'#222',mut=cs.getPropertyValue('--mut').trim()||'#888',bd=cs.getPropertyValue('--bd').trim()||'#ddd',card=cs.getPropertyValue('--card').trim()||'#fff';
+ const N=CH.d.length,n=CH.range,s0=N-n;
+ const L=8,R=60,T=10,B=24,pw=W-L-R,ph=H-T-B;
+ let mn=Infinity,mx=-Infinity;
+ for(let i=s0;i<N;i++){
+  if(CH.l[i]!=null)mn=Math.min(mn,CH.l[i]);
+  if(CH.h[i]!=null)mx=Math.max(mx,CH.h[i]);
+  if(CH.u[i]!=null){mx=Math.max(mx,CH.u[i]);mn=Math.min(mn,CH.b[i]);}
+ }
+ if(!isFinite(mn)||!isFinite(mx))return;
+ const pad=(mx-mn)*0.05||1;mn-=pad;mx+=pad;
+ const X=i=>L+(i-s0+0.5)*pw/n,Y=v=>T+(mx-v)/(mx-mn)*ph;
+ CH.lay={L,pw,n,s0};
+ x.clearRect(0,0,W,H);
+ x.font='11px system-ui,-apple-system,Segoe UI,sans-serif';
+ /* grid + price axis */
+ x.textAlign='left';x.textBaseline='middle';x.lineWidth=1;
+ for(let k=0;k<=5;k++){
+  const v=mn+(mx-mn)*k/5,y=Y(v);
+  x.strokeStyle=bd;x.beginPath();x.moveTo(L,y);x.lineTo(W-R,y);x.stroke();
+  x.fillStyle=mut;x.fillText(nf(v),W-R+6,y);
+ }
+ /* date axis */
+ x.textAlign='center';x.textBaseline='top';x.fillStyle=mut;
+ const ticks=W<600?4:7;
+ for(let k=0;k<ticks;k++){
+  const i=s0+Math.round((n-1)*k/(ticks-1));
+  const p=CH.d[i].split('-');
+  x.fillText(+p[2]+' '+MON[+p[1]-1]+(k===0?' '+p[0].slice(2):''),X(i),H-B+6);
+ }
+ /* channel band */
+ const idx=[];for(let i=s0;i<N;i++)if(CH.u[i]!=null&&CH.b[i]!=null)idx.push(i);
+ if(idx.length>1){
+  x.beginPath();
+  idx.forEach((i,k)=>{k?x.lineTo(X(i),Y(CH.u[i])):x.moveTo(X(i),Y(CH.u[i]))});
+  for(let k=idx.length-1;k>=0;k--)x.lineTo(X(idx[k]),Y(CH.b[idx[k]]));
+  x.closePath();x.fillStyle='rgba(130,150,180,0.13)';x.fill();
+  x.strokeStyle='rgba(130,150,180,0.6)';x.lineWidth=1;x.setLineDash([4,3]);
+  [CH.u,CH.b].forEach(a=>{x.beginPath();idx.forEach((i,k)=>{k?x.lineTo(X(i),Y(a[i])):x.moveTo(X(i),Y(a[i]))});x.stroke();});
+  x.setLineDash([]);
+ }
+ /* candles coloured by strategy state */
+ const bw=Math.max(1,Math.min(14,pw/n*0.66));
+ for(let i=s0;i<N;i++){
+  if(CH.c[i]==null)continue;
+  const col=CC[stOf(CH.c,CH.u,CH.b,i)];
+  const o=CH.o[i]==null?CH.c[i]:CH.o[i],c=CH.c[i],h=CH.h[i]==null?Math.max(o,c):CH.h[i],l=CH.l[i]==null?Math.min(o,c):CH.l[i];
+  x.strokeStyle=col;x.fillStyle=col;x.lineWidth=1;
+  x.beginPath();x.moveTo(X(i),Y(h));x.lineTo(X(i),Y(l));x.stroke();
+  const top=Y(Math.max(o,c)),bot=Y(Math.min(o,c));
+  x.fillRect(X(i)-bw/2,top,bw,Math.max(1,bot-top));
+ }
+ /* baseline coloured like the indicator line */
+ x.lineWidth=2.6;x.lineCap='round';
+ for(let i=s0+1;i<N;i++){
+  if(CH.e[i]==null||CH.e[i-1]==null)continue;
+  x.strokeStyle=CC[stOf(CH.c,CH.u,CH.b,i)];
+  x.beginPath();x.moveTo(X(i-1),Y(CH.e[i-1]));x.lineTo(X(i),Y(CH.e[i]));x.stroke();
+ }
+ /* flip markers */
+ for(let i=s0;i<N;i++){
+  const a=stOf(CH.c,CH.u,CH.b,i-1),b=stOf(CH.c,CH.u,CH.b,i);
+  if(i<1||!a||!b||a===b||CH.l[i]==null)continue;
+  const px=X(i),py=Y(CH.l[i])+12;
+  x.beginPath();x.moveTo(px,py-6);x.lineTo(px-5,py+3);x.lineTo(px+5,py+3);x.closePath();
+  x.fillStyle=CC[b];x.fill();x.strokeStyle=tx;x.lineWidth=1;x.stroke();
+ }
+ /* hover crosshair + tooltip */
+ const hv=CH.hover;
+ if(hv>=s0&&hv<N&&CH.c[hv]!=null){
+  x.strokeStyle=mut;x.lineWidth=1;x.setLineDash([3,3]);
+  x.beginPath();x.moveTo(X(hv),T);x.lineTo(X(hv),T+ph);x.stroke();x.setLineDash([]);
+  const o=CH.o[hv]==null?CH.c[hv]:CH.o[hv];
+  const sc=stOf(CH.c,CH.u,CH.b,hv);
+  const txt=fdate(CH.d[hv])+'   O '+nf(o)+'  H '+nf(CH.h[hv])+'  L '+nf(CH.l[hv])+'  C '+nf(CH.c[hv])+'   '+CN[sc];
+  x.font='12px system-ui,-apple-system,Segoe UI,sans-serif';
+  x.textAlign='left';x.textBaseline='middle';
+  const tw=x.measureText(txt).width+30;
+  x.fillStyle=card;x.globalAlpha=0.92;x.fillRect(L+4,T+4,tw,22);x.globalAlpha=1;
+  x.strokeStyle=bd;x.strokeRect(L+4,T+4,tw,22);
+  x.fillStyle=CC[sc];x.beginPath();x.arc(L+14,T+15,5,0,Math.PI*2);x.fill();
+  x.fillStyle=tx;x.fillText(txt,L+24,T+15);
+ }
+}
+function hoverAt(clientX){
+ if(!CH||!CH.lay)return;
+ const rect=$('#cv').getBoundingClientRect();
+ const {L,pw,n,s0}=CH.lay;
+ let i=Math.floor((clientX-rect.left-L)/(pw/n))+s0;
+ i=Math.max(s0,Math.min(s0+n-1,i));
+ if(i!==CH.hover){CH.hover=i;drawChart();}
+}
+
+$('#meta').textContent='Last updated: '+D.updated+' · data through '+fdate(D.asof)+' · '+ROWS.length+' stocks flipped in the last '+D.window+' days (of '+D.scanned+' scanned)'+(D.skipped?' · '+D.skipped+' skipped':'');
+$('#days').options[0].text='Last '+D.window+' days';
+(function(){
+ const n=new Date(Date.now()+5.5*3600*1000);
+ const today=Date.UTC(n.getUTCFullYear(),n.getUTCMonth(),n.getUTCDate());
+ const mins=n.getUTCHours()*60+n.getUTCMinutes();
+ const a=D.asof.split('-');const as=Date.UTC(+a[0],+a[1]-1,+a[2]);
+ let cnt=0;
+ for(let t=as+864e5;t<=today;t+=864e5){
+  const wd=new Date(t).getUTCDay();
+  if(wd===0||wd===6)continue;
+  if(t===today&&mins<17*60)continue;
+  cnt++;
+ }
+ if(cnt>=1){
+  const w=$('#warn');w.hidden=false;
+  w.textContent='Latest candle in this data is '+fdate(D.asof)+'. About '+cnt+' newer trading day'+(cnt>1?'s':'')+' may be missing. The site refreshes after 4:45 PM IST on weekdays; if this stays after the next refresh, the data source has not published yet, or a market holiday is in between.';
+ }
+})();
 $('#q').oninput=e=>{S.q=e.target.value;render()};
 $('#days').onchange=e=>{S.days=+e.target.value;render()};
 $('#cur').onchange=e=>{S.cur=e.target.value;render()};
 $('#hg').onchange=e=>{S.hg=e.target.checked;render()};
+$('#t').addEventListener('click',e=>{
+ const a=e.target.closest('.tvb');if(!a)return;
+ if(e.ctrlKey||e.metaKey||e.shiftKey||e.button===1)return;
+ e.preventDefault();const r=BYS[a.dataset.s];if(r)openChart(r);
+});
+$('#mx').onclick=closeChart;
+$('#md').addEventListener('click',e=>{if(e.target.id==='md')closeChart();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#md').hidden)closeChart();});
+document.querySelectorAll('.mbtn button[data-r]').forEach(b=>b.onclick=()=>{
+ CUR_RANGE=+b.dataset.r;
+ document.querySelectorAll('.mbtn button[data-r]').forEach(x=>x.classList.toggle('on',x===b));
+ if(CH){CH.range=Math.min(CUR_RANGE,CH.d.length);drawChart();}
+});
+const cvEl=$('#cv');
+cvEl.addEventListener('mousemove',e=>hoverAt(e.clientX));
+cvEl.addEventListener('mouseleave',()=>{if(CH){CH.hover=-1;drawChart();}});
+cvEl.addEventListener('touchstart',e=>{if(e.touches[0])hoverAt(e.touches[0].clientX);},{passive:true});
+cvEl.addEventListener('touchmove',e=>{if(e.touches[0])hoverAt(e.touches[0].clientX);},{passive:true});
+window.addEventListener('resize',()=>{if(CH)drawChart();});
 chips();render();
 </script>
 </body>
@@ -522,6 +680,20 @@ def run_check(symbol):
     print("\nLast 6 flips (date = the bar where the NEW colour first appears):")
     for i, a, b in flips[-6:][::-1]:
         print(f"  {d.index[i].strftime('%Y-%m-%d')}  {NAMES[a]} -> {NAMES[b]}")
+
+
+def write_chart_files(results, cleanup):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    keep = set()
+    for s, r in results.items():
+        fn = tv_symbol(s) + ".json"
+        keep.add(fn)
+        with open(os.path.join(DATA_DIR, fn), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(r["chart"], separators=(",", ":")))
+    if cleanup:
+        for fn in os.listdir(DATA_DIR):
+            if fn.endswith(".json") and fn not in keep:
+                os.remove(os.path.join(DATA_DIR, fn))
 
 
 def main():
@@ -585,9 +757,14 @@ def main():
     if skipped:
         log(f"Skipped {len(skipped)}: {', '.join(skipped)}")
 
-    # extras
+    scanned = len(results)
+    log(f"Latest candle in data: {asof.strftime('%Y-%m-%d')}")
+    # keep only stocks whose latest flip is inside the window
+    results = {s: r for s, r in results.items()
+               if r["fd"] is not None and (asof - r["fd"]).days <= FLIP_WINDOW_DAYS}
+    log(f"{len(results)} of {scanned} stocks flipped in the last {FLIP_WINDOW_DAYS} days")
+
     fund = refresh_fundamentals(list(results.keys()))
-    slug_toks = {s: toks(s) for s in load_dhan_slugs()}
 
     rows = []
     for s, r in results.items():
@@ -595,7 +772,7 @@ def main():
         f = fund.get(s, {})
         fd = r["fd"]
         rows.append({
-            "n": nm, "s": s, "tv": tv_link(s), "dh": match_dhan(str(names.get(s, s)), slug_toks),
+            "n": nm, "s": s, "f": tv_symbol(s), "tv": tv_link(s),
             "ltp": r["ltp"], "chg": r["chg"], "vol": r["vol"], "hi": r["hi"], "lo": r["lo"],
             "r1": r["r1"], "r2": r["r2"], "r3": r["r3"],
             "pe": f.get("pe"), "roe": f.get("roe"), "eps": f.get("eps"),
@@ -604,17 +781,20 @@ def main():
             "fd": fd.strftime("%Y-%m-%d") if fd is not None else None,
             "fdays": (asof - fd).days if fd is not None else None,
         })
-    rows.sort(key=lambda x: (x["fd"] is None, "" if x["fd"] is None else x["fd"]), reverse=False)
     rows.sort(key=lambda x: x["fd"] or "", reverse=True)
+
+    write_chart_files(results, cleanup=not args.limit)
 
     meta = {
         "updated": dt.datetime.now(IST).strftime("%d %b %Y, %H:%M IST"),
         "asof": asof.strftime("%Y-%m-%d"),
         "skipped": len(skipped),
+        "scanned": scanned,
+        "window": FLIP_WINDOW_DAYS,
     }
     with open(OUT_HTML, "w", encoding="utf-8") as fh:
         fh.write(build_html(rows, meta))
-    log(f"Wrote {OUT_HTML}: {len(rows)} stocks, data through {meta['asof']}")
+    log(f"Wrote {OUT_HTML} and {len(results)} chart files, data through {meta['asof']}")
 
 
 if __name__ == "__main__":
